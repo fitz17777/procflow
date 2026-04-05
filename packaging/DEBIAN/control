@@ -1,0 +1,11 @@
+Package: procflow
+Version: 1.0.0
+Architecture: amd64
+Maintainer: procflow
+Depends: python3, python3-bpfcc
+Suggests: man-db
+Description: Process-enriched network flow logger
+ eBPF-based tool that captures TCP and UDP flows and enriches each record
+ with host OS context: process name, PID, UID, username, and (for inbound
+ TCP sessions) the authenticated PAM username of the connecting user.
+ Output is newline-delimited JSON written to a rotating log file and stdout.

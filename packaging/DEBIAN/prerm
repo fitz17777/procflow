@@ -1,0 +1,7 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "remove" ]; then
+    systemctl stop procflow.service    || true
+    systemctl disable procflow.service || true
+fi

@@ -1,0 +1,462 @@
+.TH PROCFLOW 8 "April 2026" "ProcFlow 1.0.0" "System Administration"
+.
+.SH NAME
+procflow \- process-enriched network flow logger
+.
+.SH SYNOPSIS
+.B procflow
+.RB [ \-\-config
+.IR PATH ]
+.RB [ \-\-log\-file
+.IR PATH ]
+.RB [ \-\-stdout\-only ]
+.RB [ \-\-no\-pam ]
+.br
+.B procflow
+.B \-\-version
+.br
+.B procflow
+.B \-\-help
+.
+.SH DESCRIPTION
+.B procflow
+is an eBPF-based network flow monitor that captures TCP and UDP connections
+on a Linux host and emits newline-delimited JSON records to both stdout and a
+rotating log file.
+Each record is enriched with host OS context: the process name, PID, UID,
+username, and \(em for inbound TCP sessions such as SSH \(em the authenticated
+PAM username of the connecting user.
+.PP
+The eBPF program is compiled at startup using BCC and loaded into the kernel.
+kprobes are attached to TCP connect, accept, send, receive, and close paths,
+and to UDP send and receive paths.
+uprobes are attached to
+.BR pam_get_item (3)
+in
+.I libpam.so.0
+to capture authentication context.
+.PP
+.B procflow
+must be run as root.
+.
+.SH OPTIONS
+.TP
+.BI \-\-config\  PATH
+Read configuration from
+.IR PATH .
+If the file does not exist, built-in defaults are used.
+Default:
+.IR /etc/procflow/procflow.conf .
+.TP
+.BI \-\-log\-file\  PATH
+Write the JSON log to
+.I PATH
+instead of the path specified in the config file.
+Log rotation settings from the config file still apply.
+Useful for ad-hoc captures without editing the config.
+.TP
+.B \-\-stdout\-only
+Write JSON records only to stdout; do not open or rotate a log file.
+Useful when piping output to other tools such as
+.BR jq (1)
+or
+.BR filebeat (1).
+.TP
+.B \-\-no\-pam
+Skip attaching the PAM uprobes.
+Flow events are still captured with process and user context, but the
+.I authenticated_user
+and
+.I pam_service
+fields will always be null and
+.I child_processes
+will always be empty.
+Use this if the PAM uprobe causes issues or PAM enrichment is not required.
+.TP
+.B \-\-version
+Print the program version and exit.
+.TP
+.B \-\-help
+Print a usage summary and exit.
+.
+.SH CONFIGURATION FILE
+The configuration file uses INI format, read by Python's
+.BR configparser .
+A missing file is silently ignored and defaults are used.
+The default location is
+.IR /etc/procflow/procflow.conf .
+.PP
+.B [logging] section
+.TP
+.B log_file
+Absolute path to the JSON log file.
+Default:
+.IR /var/log/procflow/enriched_flow.log .
+.TP
+.B max_bytes
+Maximum log file size in bytes before rotation.
+When the active log file reaches this size it is renamed to
+.I enriched_flow.log.1
+(and so on up to
+.IR backup_count )
+and a new file is started.
+Default:
+.B 52428800
+(50\ MB).
+.TP
+.B backup_count
+Number of rotated log files to retain.
+With the defaults, up to 250\ MB of log history is kept on disk.
+Default:
+.BR 5 .
+.PP
+.B [tuning] section
+.TP
+.B pam_collect_secs
+Seconds to hold an inbound TCP flow in the PAM-pending queue after the first
+PAM match, to allow
+.B PAM_SERVICE
+to arrive after
+.BR PAM_USER .
+On some sshd configurations these calls are separated by a few milliseconds.
+Default:
+.BR 1.0 .
+.TP
+.B pam_window_secs
+Maximum seconds to wait for any PAM match on an inbound TCP flow before
+emitting the record without PAM enrichment.
+Default:
+.BR 15.0 .
+.TP
+.B flow_short_secs
+TCP connections that have been open for at least this many seconds without
+closing will emit a
+.B flow_long_open
+record at this mark.
+Connections that close before this threshold emit a single
+.B flow_short
+record.
+Default:
+.BR 30.0 .
+.TP
+.B flow_track_secs
+Maximum seconds to track an open flow before evicting it from the in-memory
+table (safety fallback for connections that close without a
+.B tcp_close
+event being observed).
+Default:
+.BR 3600.0 .
+.
+.SH OUTPUT FORMAT
+All output is newline-delimited JSON.
+Records written to stdout and to the log file are identical.
+.PP
+.B Common fields (all event types)
+.TP
+.B event_type
+One of
+.BR flow_short ,
+.BR flow_long_open ,
+or
+.BR flow_long_closed .
+.TP
+.B session_id
+UUID4 string.
+Identical on the
+.B flow_long_open
+and
+.B flow_long_closed
+records for the same connection, allowing correlation in a log aggregation
+or SIEM system.
+.TP
+.B timestamp
+ISO 8601 timestamp (UTC) of when the event was generated in userspace.
+.TP
+.B direction
+.B inbound
+or
+.BR outbound .
+.TP
+.B protocol
+.B TCP
+or
+.BR UDP .
+.TP
+.B address_family
+.B IPv4
+or
+.BR IPv6 .
+.TP
+.B src_ip\fR,\fP src_port\fR,\fP dst_ip\fR,\fP dst_port
+Connection endpoints from the client's perspective.
+For inbound flows,
+.I src_ip
+is the remote peer and
+.I dst_ip
+is the local address.
+.TP
+.B pid\fR,\fP ppid
+Process ID and parent process ID of the process that owns the socket.
+.TP
+.B uid\fR,\fP username
+Numeric UID and resolved username of the socket-owning process.
+.TP
+.B process
+Executable name (up to 15 characters, from the kernel comm field).
+.TP
+.B authenticated_user
+The username authenticated via PAM, if correlation succeeded.
+Null for outbound flows, UDP, or inbound flows where PAM enrichment was
+not available.
+.TP
+.B pam_service
+The PAM service name (e.g.\&
+.BR sshd )
+associated with the authentication, if available.
+.TP
+.B child_processes
+Array of PAM child process objects correlated to this flow via /proc ancestry
+walking.
+Each object contains
+.BR pid ,
+.BR ppid ,
+.BR process ,
+.BR authenticated_user ,
+.BR pam_service ,
+and
+.BR timestamp .
+Empty for outbound flows and UDP.
+.TP
+.B tx_bytes\fR,\fP rx_bytes
+Bytes sent and received on the socket.
+Accumulated in kernel space via kprobes on
+.BR tcp_sendmsg ,
+.BR tcp_cleanup_rbuf ,
+.BR udp_sendmsg ,
+and
+.BR udp_recvmsg .
+On
+.B flow_long_open
+records these are a snapshot at the
+.I flow_short_secs
+mark, not final values.
+.PP
+.B flow_short
+.RS
+Emitted when a TCP connection closes before
+.I flow_short_secs
+have elapsed, or when a UDP socket is destroyed.
+One record per connection; contains all fields above with final byte counts.
+.RE
+.PP
+.B flow_long_open
+.RS
+Emitted once a TCP connection has been open for
+.I flow_short_secs
+without closing.
+TX/RX byte counts are read from the BPF map at this moment and represent
+bytes transferred up to the snapshot time, not the connection total.
+A corresponding
+.B flow_long_closed
+record will follow when the connection eventually closes.
+.RE
+.PP
+.B flow_long_closed
+.RS
+Emitted when a TCP connection that previously generated a
+.B flow_long_open
+record finally closes.
+TX/RX byte counts are the connection totals delivered by the kernel at close time.
+Match to
+.B flow_long_open
+using
+.BR session_id .
+.RE
+.
+.SH FILES
+.TP
+.I /etc/procflow/procflow.conf
+Default configuration file.
+.TP
+.I /var/log/procflow/enriched_flow.log
+Default log file (created by the postinst script on package install).
+.TP
+.I /var/log/procflow/enriched_flow.log.1 \fR...\fP enriched_flow.log.5
+Rotated log files.
+.TP
+.I /lib/systemd/system/procflow.service
+systemd unit file (installed by the package).
+.
+.SH REQUIREMENTS
+.IP \(bu 2
+Linux kernel 4.9 or later (eBPF kprobes, perf buffer)
+.IP \(bu 2
+Root privileges
+.IP \(bu 2
+.B python3-bpfcc
+(BCC Python bindings)
+.IP \(bu 2
+Kernel headers matching the running kernel:
+.B linux-headers-$(uname -r)
+.
+.SH EXAMPLES
+Run with default config as a foreground process:
+.PP
+.RS
+.B sudo procflow
+.RE
+.PP
+Override the log file for a one-off capture:
+.PP
+.RS
+.B sudo procflow --log-file /tmp/capture.log
+.RE
+.PP
+Pipe to jq to watch only completed short flows in real time:
+.PP
+.RS
+.B sudo procflow --stdout-only | jq 'select(.event_type == "flow_short")'
+.RE
+.PP
+Run without PAM enrichment (lower overhead, no sshd username annotation):
+.PP
+.RS
+.B sudo procflow --no-pam
+.RE
+.PP
+Test an alternate config file:
+.PP
+.RS
+.B sudo procflow --config /etc/procflow/procflow-test.conf --stdout-only
+.RE
+.PP
+Check version:
+.PP
+.RS
+.B procflow --version
+.RE
+.
+.SH PERFORMANCE
+The eBPF byte-counting hooks (tcp_sendmsg, tcp_cleanup_rbuf, udp_sendmsg,
+udp_recvmsg) use a
+.I tracked_socks
+hash map as an early-exit gate: the hooks return immediately for any socket
+not explicitly registered by
+.BR procflow .
+On a busy host with a mix of monitored and unmonitored traffic, overhead for
+unrelated connections is near zero.
+.PP
+The BPF perf buffer is polled every 100\ ms from userspace.
+PAM correlation and flow aging are also processed on this interval.
+.
+.SH NOTES
+The eBPF program is compiled from C source at startup using BCC.
+The first startup on a machine may take several seconds.
+Subsequent startups are faster due to BCC's kernel module cache.
+.PP
+The
+.I authenticated_user
+field relies on sshd writing PAM credentials before the SSH session is fully
+established.
+In rare cases (PAM stacks that call
+.BR pam_get_item (3)
+very late, or non-standard sshd configurations) the field may be null even for
+authenticated sessions.
+The
+.I pam_window_secs
+tuning parameter can be increased if this is observed.
+.PP
+UDP flows use
+.B udp_destroy_sock
+as the close event.
+The timestamp on a UDP
+.B flow_short
+record reflects when the socket was destroyed, which may be significantly after
+the last datagram was sent or received.
+.
+.SH SECURITY
+.SS eBPF safety
+The eBPF program embedded in
+.B procflow
+is validated by the Linux kernel verifier before it is loaded.
+The verifier enforces memory safety, bounded execution, and correct register
+use; the program cannot crash the kernel, escape its sandbox, or access
+arbitrary kernel memory.
+The tool is read-only by design: it observes events but does not modify
+kernel state or network traffic.
+.PP
+.SS Log file sensitivity
+The log file contains authenticated usernames, process names, PIDs, and
+full connection metadata.
+It is created with mode
+.B 640
+(read-write for root, read-only for the
+.I adm
+group) regardless of the process umask.
+Do not relax these permissions.
+Treat the log file with the same care as
+.I /var/log/auth.log.
+.PP
+.SS Protecting the binary
+.B procflow
+embeds eBPF C source code that is compiled and loaded into the kernel at
+startup.
+If an unprivileged user can modify the binary at
+.IR /usr/sbin/procflow ,
+they can inject arbitrary kernel-mode code the next time the service starts.
+The installed binary is owned
+.B root:root
+with mode
+.B 755
+(not writable by non-root).
+Verify this after install:
+.PP
+.RS
+.B ls -l /usr/sbin/procflow
+.RE
+.PP
+If running directly from source rather than the installed package, ensure
+the source file is also root-owned and not group- or world-writable.
+.PP
+.SS Capability bounding
+The systemd service sets
+.B CapabilityBoundingSet
+to restrict the process to only the capabilities required for BPF loading and
+/proc reading
+.RB ( CAP_SYS_ADMIN ,
+.BR CAP_BPF ,
+.BR CAP_PERFMON ,
+.BR CAP_SYS_PTRACE ).
+Even though the process runs as root, it cannot exercise capabilities outside
+this set.
+.PP
+On Linux 5.8 and later,
+.B CAP_BPF
+and
+.B CAP_PERFMON
+were split from
+.BR CAP_SYS_ADMIN .
+Future versions of this package may drop
+.B CAP_SYS_ADMIN
+from the bounding set on systems that support the finer-grained capabilities.
+.PP
+.SS What procflow cannot do
+Despite running as root, the hardened service unit prevents
+.BR procflow
+from: loading kernel modules, modifying cgroup settings, accessing user home
+directories, acquiring real-time scheduling priority, changing its
+execution domain via
+.BR personality (2),
+reading the kernel log buffer, creating new namespaces, or using address
+families other than AF_UNIX, AF_INET, and AF_INET6.
+.
+.SH SEE ALSO
+.BR bpftool (8),
+.BR tcpdump (8),
+.BR ss (8),
+.BR jq (1),
+.BR journalctl (1),
+.BR systemctl (1)
+.
+.SH AUTHOR
+ProcFlow is an eBPF-based host network flow enrichment tool.

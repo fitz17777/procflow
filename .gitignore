@@ -1,0 +1,5 @@
+.claude/
+packaging/procflow_*/
+*.deb
+__pycache__/
+*.pyc

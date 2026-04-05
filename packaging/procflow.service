@@ -1,0 +1,57 @@
+[Unit]
+Description=Process-Enriched Network Flow Logger (ProcFlow)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/procflow
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=procflow
+
+# ── Security hardening ──────────────────────────────────────────────────────
+# Bound the capabilities the process can ever use. On Linux 5.8+, CAP_BPF and
+# CAP_PERFMON are the minimum for BPF; CAP_SYS_ADMIN covers older kernels.
+# CAP_SYS_PTRACE is required for /proc ancestry walking.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
+
+# Prevent the process from gaining new privileges via setuid/setgid or
+# file capabilities after startup.
+NoNewPrivileges=yes
+
+# Give the process a private /tmp namespace, isolated from the global /tmp.
+PrivateTmp=yes
+
+# Prevent access to users' home directories.
+ProtectHome=yes
+
+# NOTE: ProtectKernelModules is intentionally NOT set. BCC needs read access
+# to /lib/modules/$(uname -r)/build to compile the eBPF program at startup.
+# That directive makes /lib/modules unavailable, which breaks BPF compilation.
+
+# Prevent modification of cgroup settings.
+ProtectControlGroups=yes
+
+# Prevent personality(2) calls that could change the execution domain.
+LockPersonality=yes
+
+# Prevent the process from acquiring real-time scheduling priority.
+RestrictRealtime=yes
+
+# Prevent reading the kernel log buffer (/proc/kmsg, /proc/sysrq-trigger).
+ProtectKernelLogs=yes
+
+# Prevent creating new namespaces, blocking a class of container-escape attacks.
+RestrictNamespaces=yes
+
+# Restrict to only the address families the tool actually uses.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# NOTE: MemoryDenyWriteExecute is intentionally NOT set. BCC uses LLVM to
+# JIT-compile the eBPF program at startup, which requires W+X mappings.
+# Setting this directive would prevent the BPF program from loading.
+
+[Install]
+WantedBy=multi-user.target

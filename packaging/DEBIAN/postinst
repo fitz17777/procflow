@@ -1,0 +1,19 @@
+#!/bin/bash
+set -e
+
+if [ "$1" = "configure" ]; then
+    # Create log directory owned by root, readable by adm group only.
+    # The log contains authenticated usernames and must not be world-readable.
+    mkdir -p /var/log/procflow
+    chown root:adm /var/log/procflow
+    chmod 750 /var/log/procflow
+
+    # Ensure the binary is root-owned and not writable by non-root.
+    # This matters because the binary contains eBPF C code compiled into
+    # the kernel at startup — a writable binary is a kernel code injection risk.
+    chown root:root /usr/sbin/procflow
+    chmod 755 /usr/sbin/procflow
+
+    systemctl daemon-reload
+    systemctl enable --now procflow.service
+fi
