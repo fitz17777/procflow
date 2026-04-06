@@ -645,6 +645,25 @@ def uid_to_username(uid: int) -> str:
         return str(uid)
 
 
+def proc_name(tgid: int, comm_fallback: bytes) -> str:
+    """Return the process name for the given TGID.
+
+    bpf_get_current_comm() reads the *thread* comm, which for multi-threaded
+    apps (Firefox, browsers, JVMs) is the worker thread name ("Socket Thread",
+    "DNS Resolver #63") rather than the executable name ("firefox-esr").
+    Reading /proc/{tgid}/comm always returns the main thread (group leader)
+    comm, which is the process name visible in `ps`.
+
+    Falls back to the BPF-captured comm if /proc is unavailable (e.g. the
+    process has already exited).
+    """
+    try:
+        with open(f"/proc/{tgid}/comm") as f:
+            return f.read().strip()
+    except OSError:
+        return comm_fallback.decode("utf-8", errors="replace").strip("\x00")
+
+
 # ── /proc ancestry walker ─────────────────────────────────────────────────────
 def get_ppid_from_proc(pid: int):
     try:
@@ -870,7 +889,7 @@ def handle_event(cpu, data, size):
         child_entry = {
             "pid":                ev.pid,
             "ppid":               ev.ppid,
-            "process":            ev.comm.decode("utf-8", errors="replace"),
+            "process":            proc_name(ev.pid, ev.comm),
             "authenticated_user": username or None,
             "pam_service":        service  or None,
             "timestamp":          datetime.now(timezone.utc).isoformat(),
@@ -927,7 +946,7 @@ def handle_event(cpu, data, size):
         "ppid":               ev.ppid,
         "uid":                ev.uid,
         "username":           uid_to_username(ev.uid),
-        "process":            ev.comm.decode("utf-8", errors="replace"),
+        "process":            proc_name(ev.pid, ev.comm),
         "protocol":           proto_name(ev.proto),
         "address_family":     af_str,
         "src_ip":             src_ip,
