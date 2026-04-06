@@ -28,7 +28,7 @@ Requirements:
     sudo apt install python3-bpfcc bpfcc-tools linux-headers-$(uname -r)
 """
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import argparse
 import configparser
@@ -1011,6 +1011,7 @@ def main():
             '  sudo procflow --log-file /tmp/flows.log\n'
             '  sudo procflow --stdout-only | jq \'select(.event_type == "flow_short")\'\n'
             '  sudo procflow --no-pam --stdout-only\n'
+            '  sudo procflow --clear-log\n'
         ),
     )
     parser.add_argument(
@@ -1029,6 +1030,10 @@ def main():
         '--no-pam', action='store_true',
         help='Skip PAM uprobe attachment; flows are captured without '
              'authenticated_user enrichment')
+    parser.add_argument(
+        '--clear-log', action='store_true',
+        help='Truncate the active log file and remove rotated backups, then exit. '
+             'Safe to run while the service is active.')
     args = parser.parse_args()
 
     if os.geteuid() != 0:
@@ -1038,6 +1043,27 @@ def main():
     log_file, max_bytes, backups = load_config(args.config)
     if args.log_file:
         log_file = args.log_file
+
+    if args.clear_log:
+        # Truncate the active log in-place so the running daemon's file
+        # descriptor stays valid — it will simply continue writing from byte 0.
+        try:
+            with open(log_file, 'w'):
+                pass
+        except FileNotFoundError:
+            pass
+        removed = []
+        for i in range(1, backups + 1):
+            backup = f"{log_file}.{i}"
+            try:
+                os.remove(backup)
+                removed.append(backup)
+            except FileNotFoundError:
+                break
+        print(json.dumps({"status": "log cleared", "log_file": log_file,
+                          "backups_removed": removed}))
+        sys.exit(0)
+
     setup_logging(log_file, max_bytes, backups, stdout_only=args.stdout_only)
 
     try:

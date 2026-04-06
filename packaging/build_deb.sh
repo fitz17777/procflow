@@ -4,7 +4,7 @@
 set -euo pipefail
 
 PKG=procflow
-VER=1.0.2
+VER=1.0.3
 ARCH=amd64
 STAGE="${PKG}_${VER}_${ARCH}"
 
