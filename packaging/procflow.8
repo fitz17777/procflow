@@ -402,7 +402,7 @@ Treat the log file with the same care as
 embeds eBPF C source code that is compiled and loaded into the kernel at
 startup.
 If an unprivileged user can modify the binary at
-.IR /usr/sbin/procflow ,
+.IR /usr/bin/procflow ,
 they can inject arbitrary kernel-mode code the next time the service starts.
 The installed binary is owned
 .B root:root
@@ -412,7 +412,7 @@ with mode
 Verify this after install:
 .PP
 .RS
-.B ls -l /usr/sbin/procflow
+.B ls -l /usr/bin/procflow
 .RE
 .PP
 If running directly from source rather than the installed package, ensure

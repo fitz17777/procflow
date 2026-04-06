@@ -28,7 +28,7 @@ Requirements:
     sudo apt install python3-bpfcc bpfcc-tools linux-headers-$(uname -r)
 """
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 
 import argparse
 import configparser
