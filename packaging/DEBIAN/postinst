@@ -11,9 +11,10 @@ if [ "$1" = "configure" ]; then
     # Ensure the binary is root-owned and not writable by non-root.
     # This matters because the binary contains eBPF C code compiled into
     # the kernel at startup — a writable binary is a kernel code injection risk.
-    chown root:root /usr/sbin/procflow
-    chmod 755 /usr/sbin/procflow
+    chown root:root /usr/bin/procflow
+    chmod 755 /usr/bin/procflow
 
     systemctl daemon-reload
-    systemctl enable --now procflow.service
+    systemctl enable procflow.service
+    systemctl restart procflow.service
 fi
