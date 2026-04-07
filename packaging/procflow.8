@@ -1,4 +1,4 @@
-.TH PROCFLOW 8 "April 2026" "ProcFlow 1.0.0" "System Administration"
+.TH PROCFLOW 8 "April 2026" "ProcFlow 1.1.0" "System Administration"
 .
 .SH NAME
 procflow \- process-enriched network flow logger
@@ -13,6 +13,9 @@ procflow \- process-enriched network flow logger
 .RB [ \-\-no\-pam ]
 .br
 .B procflow
+.B \-\-clear\-log
+.br
+.B procflow
 .B \-\-version
 .br
 .B procflow
@@ -20,16 +23,21 @@ procflow \- process-enriched network flow logger
 .
 .SH DESCRIPTION
 .B procflow
-is an eBPF-based network flow monitor that captures TCP and UDP connections
-on a Linux host and emits newline-delimited JSON records to both stdout and a
-rotating log file.
-Each record is enriched with host OS context: the process name, PID, UID,
-username, and \(em for inbound TCP sessions such as SSH \(em the authenticated
-PAM username of the connecting user.
+is an eBPF-based network flow monitor that captures TCP, UDP, and ICMP
+connections on a Linux host and emits newline-delimited JSON records to both
+stdout and a rotating log file.
+.PP
+Each record is enriched with host OS context: the full executable path, command
+line, process name, PID, UID, username, socket inode (for Wireshark and
+.BR ss (8)
+correlation), network namespace (for container traffic detection), and \(em for
+inbound TCP sessions such as SSH \(em the authenticated PAM username of the
+connecting user.
 .PP
 The eBPF program is compiled at startup using BCC and loaded into the kernel.
-kprobes are attached to TCP connect, accept, send, receive, and close paths,
-and to UDP send and receive paths.
+kprobes are attached to TCP connect, accept, send, receive, and close paths;
+UDP send and receive paths; raw socket send paths for ICMP/ICMPv6; and the
+kernel ICMP receive path for inbound ICMP.
 uprobes are attached to
 .BR pam_get_item (3)
 in
@@ -65,13 +73,18 @@ or
 .B \-\-no\-pam
 Skip attaching the PAM uprobes.
 Flow events are still captured with process and user context, but the
-.I authenticated_user
+.IR authenticated_user ,
+.IR pam_service ,
 and
-.I pam_service
-fields will always be null and
 .I child_processes
-will always be empty.
+fields will always be null or empty.
 Use this if the PAM uprobe causes issues or PAM enrichment is not required.
+.TP
+.B \-\-clear\-log
+Truncate the active log file in-place and remove all rotated backup files,
+then exit.
+The running service continues without interruption; it resumes writing from
+byte 0 of the same open file descriptor.
 .TP
 .B \-\-version
 Print the program version and exit.
@@ -151,36 +164,118 @@ Default:
 All output is newline-delimited JSON.
 Records written to stdout and to the log file are identical.
 .PP
-.B Common fields (all event types)
+.B Event types
 .TP
-.B event_type
-One of
-.BR flow_short ,
-.BR flow_long_open ,
-or
-.BR flow_long_closed .
+.B flow_short
+A TCP connection that closed before
+.IR flow_short_secs ,
+any UDP socket close, or any ICMP packet.
+One record per connection; contains final byte counts.
 .TP
-.B session_id
-UUID4 string.
-Identical on the
 .B flow_long_open
-and
+Emitted once a TCP connection has been open for
+.I flow_short_secs
+without closing.
+TX/RX byte counts are a snapshot at this moment, not final values.
+A corresponding
 .B flow_long_closed
-records for the same connection, allowing correlation in a log aggregation
-or SIEM system.
+record follows when the connection closes.
+Paired to
+.B flow_long_closed
+via
+.BR session_id .
+.TP
+.B flow_long_closed
+Emitted when a long-lived TCP connection that generated a
+.B flow_long_open
+record finally closes.
+TX/RX byte counts are the connection totals.
+.TP
+.B connect_failed
+Emitted when an outbound TCP connection attempt fails.
+Contains a
+.I connect_error
+field with the error name
+.RB ( ECONNREFUSED ,
+.BR ETIMEDOUT ,
+.BR ENETUNREACH ,
+or
+.BR EHOSTUNREACH ).
+Does not appear in
+.B flow_short
+because the connection was never established.
+.TP
+.B listen_start
+Emitted when a TCP socket enters the LISTEN state (i.e. after the application
+calls
+.BR listen (2)).
+Contains
+.I local_ip
+and
+.I local_port
+instead of the usual src/dst endpoint fields.
+Useful for detecting which process opened a listening port before an IDS alert
+fires.
+.PP
+.B Fields common to all TCP and UDP events
 .TP
 .B timestamp
-ISO 8601 timestamp (UTC) of when the event was generated in userspace.
+ISO 8601 timestamp (UTC) generated in userspace when the event is processed.
 .TP
 .B direction
 .B inbound
 or
 .BR outbound .
 .TP
-.B protocol
-.B TCP
+.B pid\fR,\fP ppid
+Process ID and parent process ID of the process that owns the socket.
+Null for inbound ICMP (kernel softirq context).
+.TP
+.B uid\fR,\fP username
+Numeric UID and resolved username of the socket-owning process.
+Null for inbound ICMP.
+.TP
+.B process
+Executable name read from
+.IR /proc/\fIpid\fP/comm
+(the process group leader comm, not the thread name).
+.B [kernel]
+for inbound ICMP.
+.TP
+.B exe
+Full path to the executable, read from
+.IR /proc/\fIpid\fP/exe .
+Null if the process has already exited by the time the event is processed.
+Disambiguates processes that share a comm name, e.g.
+.I python3
 or
-.BR UDP .
+.IR java .
+.TP
+.B cmdline
+Full command line from
+.I /proc/\fIpid\fP/cmdline
+(null-bytes replaced with spaces, truncated to 256 characters).
+Null for inbound ICMP or if the process has already exited.
+.TP
+.B protocol
+.BR TCP ,
+.BR UDP ,
+.BR ICMP ,
+or
+.BR ICMPv6 .
+.TP
+.B proto_hint
+Application-layer protocol label derived from the destination port.
+Examples:
+.BR SSH ,
+.BR HTTPS ,
+.BR HTTP ,
+.BR DNS ,
+.BR QUIC ,
+.BR mDNS ,
+.BR NTP ,
+.BR RDP .
+Null when no label is defined for the port.
 .TP
 .B address_family
 .B IPv4
@@ -194,29 +289,75 @@ For inbound flows,
 is the remote peer and
 .I dst_ip
 is the local address.
+For outbound ICMP,
+.I src_ip
+is
+.B 0.0.0.0
+because the source address is selected by the routing table inside the kernel
+send path after the kprobe fires.
 .TP
-.B pid\fR,\fP ppid
-Process ID and parent process ID of the process that owns the socket.
+.B sock_ino
+Socket inode number.
+Matches the inode shown by
+.B ss \-tnp
+and
+.B ss \-unp
+in the
+.I users
+column, and the inode in
+.IR /proc/net/tcp .
+Use this field to correlate a procflow record with a specific connection
+visible in Wireshark or an IDS alert without relying on timestamp fuzzing.
+Null for inbound ICMP (no userspace socket).
 .TP
-.B uid\fR,\fP username
-Numeric UID and resolved username of the socket-owning process.
+.B netns_ino
+Network namespace inode number read from
+.IR sk\->__sk_common.skc_net .
+Differs from the host namespace inode
+.RI ( /proc/1/ns/net )
+for traffic originating from containers or other network namespaces.
+Null for inbound ICMP.
 .TP
-.B process
-Executable name (up to 15 characters, from the kernel comm field).
+.B container_traffic
+Boolean.
+.B true
+when
+.I netns_ino
+is non-zero and differs from the host network namespace inode (read from
+.I /proc/1/ns/net
+at startup).
+.B false
+for host traffic.
+Null for inbound ICMP.
+.TP
+.B tx_bytes\fR,\fP rx_bytes
+Bytes sent and received on the socket, accumulated in kernel space.
+On
+.B flow_long_open
+records these are a snapshot, not final values.
+Null for ICMP (no per-socket byte accounting in the raw socket path).
+.TP
+.B session_id
+UUID4 string linking
+.B flow_long_open
+and
+.B flow_long_closed
+records for the same connection.
 .TP
 .B authenticated_user
 The username authenticated via PAM, if correlation succeeded.
-Null for outbound flows, UDP, or inbound flows where PAM enrichment was
-not available.
+Null for outbound flows, UDP, ICMP, or inbound flows where PAM enrichment
+was not available.
 .TP
 .B pam_service
 The PAM service name (e.g.\&
 .BR sshd )
-associated with the authentication, if available.
+associated with the authentication.
 .TP
 .B child_processes
-Array of PAM child process objects correlated to this flow via /proc ancestry
-walking.
+Array of PAM child process objects correlated to this flow via
+.I /proc
+ancestry walking.
 Each object contains
 .BR pid ,
 .BR ppid ,
@@ -225,52 +366,82 @@ Each object contains
 .BR pam_service ,
 and
 .BR timestamp .
-Empty for outbound flows and UDP.
+Empty for outbound flows, UDP, and ICMP.
+.PP
+.B Additional fields for connect_failed
 .TP
-.B tx_bytes\fR,\fP rx_bytes
-Bytes sent and received on the socket.
-Accumulated in kernel space via kprobes on
-.BR tcp_sendmsg ,
-.BR tcp_cleanup_rbuf ,
-.BR udp_sendmsg ,
-and
-.BR udp_recvmsg .
-On
-.B flow_long_open
-records these are a snapshot at the
-.I flow_short_secs
-mark, not final values.
+.B connect_error
+The error name returned by the failed connect syscall.
+One of
+.BR ECONNREFUSED ,
+.BR ETIMEDOUT ,
+.BR ENETUNREACH ,
+or
+.BR EHOSTUNREACH .
 .PP
-.B flow_short
+.B Additional fields for listen_start
+.TP
+.B local_ip\fR,\fP local_port
+The address and port the socket is listening on.
+.I local_ip
+is
+.B 0.0.0.0
+when the socket is bound to all interfaces.
+.PP
+.B Additional fields for DNS flows
+.TP
+.B dns_query
+Decoded DNS QNAME when
+.I proto_hint
+is
+.B DNS
+and procflow successfully captured the first 40 bytes of the UDP payload.
+Decoded from the DNS wire format starting at offset 12 (the question section).
+Null if the payload was not captured or could not be decoded (e.g.\& compressed
+labels, malformed packet, or unconnected UDP socket).
+.
+.SH WIRESHARK AND IDS CORRELATION
+.PP
+.B Identifying a process behind Wireshark traffic
 .RS
-Emitted when a TCP connection closes before
-.I flow_short_secs
-have elapsed, or when a UDP socket is destroyed.
-One record per connection; contains all fields above with final byte counts.
+Note the destination IP and port from Wireshark, then query the log:
+.PP
+.B jq 'select(.dst_ip=="203.0.113.1" and .dst_port==443)' /var/log/procflow/enriched_flow.log
+.PP
+For live traffic, correlate the socket inode directly:
+.PP
+.B ss \-tnp | grep 203.0.113.1
+.PP
+Note the inode from the
+.I users
+column, then:
+.PP
+.B jq 'select(.sock_ino==126901)' /var/log/procflow/enriched_flow.log
 .RE
 .PP
-.B flow_long_open
+.B Investigating an IDS alert
 .RS
-Emitted once a TCP connection has been open for
-.I flow_short_secs
-without closing.
-TX/RX byte counts are read from the BPF map at this moment and represent
-bytes transferred up to the snapshot time, not the connection total.
-A corresponding
-.B flow_long_closed
-record will follow when the connection eventually closes.
-.RE
+Given an alert with a timestamp and 5-tuple, query by port and time window:
 .PP
-.B flow_long_closed
-.RS
-Emitted when a TCP connection that previously generated a
-.B flow_long_open
-record finally closes.
-TX/RX byte counts are the connection totals delivered by the kernel at close time.
-Match to
-.B flow_long_open
-using
-.BR session_id .
+.B jq 'select(.dst_port==4444 and .timestamp >= "2026-04-07T12:00:00")' /var/log/procflow/enriched_flow.log
+.PP
+Use
+.I container_traffic
+to immediately redirect investigation to the container layer:
+.PP
+.B jq 'select(.container_traffic == true)' /var/log/procflow/enriched_flow.log
+.PP
+Use
+.I listen_start
+events to identify which process opened a port before the alert fired:
+.PP
+.B jq 'select(.event_type == "listen_start" and .local_port == 4444)' /var/log/procflow/enriched_flow.log
+.PP
+Use
+.I connect_failed
+events to detect local port scanners or misconfigured services:
+.PP
+.B jq 'select(.event_type == "connect_failed")' /var/log/procflow/enriched_flow.log
 .RE
 .
 .SH FILES
@@ -306,34 +477,70 @@ Run with default config as a foreground process:
 .B sudo procflow
 .RE
 .PP
+Watch only short flows in real time:
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.event_type == "flow_short")'
+.RE
+.PP
+Watch DNS queries with decoded query names:
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.dns_query != null)'
+.RE
+.PP
+Watch for container traffic:
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.container_traffic == true)'
+.RE
+.PP
+Watch for failed outbound connection attempts:
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.event_type == "connect_failed")'
+.RE
+.PP
+Watch for new listening ports with full process context:
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.event_type == "listen_start")'
+.RE
+.PP
+Watch all ICMP traffic (outbound ping and inbound responses):
+.PP
+.RS
+.B sudo procflow \-\-stdout\-only | jq 'select(.protocol == "ICMP")'
+.RE
+.PP
+Run without PAM enrichment (lower overhead):
+.PP
+.RS
+.B sudo procflow \-\-no\-pam
+.RE
+.PP
+Truncate the log while the service is running:
+.PP
+.RS
+.B sudo procflow \-\-clear\-log
+.RE
+.PP
 Override the log file for a one-off capture:
 .PP
 .RS
-.B sudo procflow --log-file /tmp/capture.log
-.RE
-.PP
-Pipe to jq to watch only completed short flows in real time:
-.PP
-.RS
-.B sudo procflow --stdout-only | jq 'select(.event_type == "flow_short")'
-.RE
-.PP
-Run without PAM enrichment (lower overhead, no sshd username annotation):
-.PP
-.RS
-.B sudo procflow --no-pam
+.B sudo procflow \-\-log\-file /tmp/capture.log
 .RE
 .PP
 Test an alternate config file:
 .PP
 .RS
-.B sudo procflow --config /etc/procflow/procflow-test.conf --stdout-only
+.B sudo procflow \-\-config /etc/procflow/procflow.conf \-\-stdout\-only
 .RE
 .PP
 Check version:
 .PP
 .RS
-.B procflow --version
+.B procflow \-\-version
 .RE
 .
 .SH PERFORMANCE
@@ -348,31 +555,66 @@ unrelated connections is near zero.
 .PP
 The BPF perf buffer is polled every 100\ ms from userspace.
 PAM correlation and flow aging are also processed on this interval.
+.PP
+Reading
+.I /proc/\fIpid\fP/exe
+and
+.I /proc/\fIpid\fP/cmdline
+per event introduces a small amount of userspace overhead.
+If the process exits before the event is processed these reads fail silently
+and the fields are null.
 .
 .SH NOTES
 The eBPF program is compiled from C source at startup using BCC.
 The first startup on a machine may take several seconds.
 Subsequent startups are faster due to BCC's kernel module cache.
 .PP
+For outbound ICMP, the
+.I src_ip
+field is always
+.B 0.0.0.0
+when the raw socket is not explicitly bound with
+.BR bind (2).
+The source address is selected by the kernel routing table inside the send
+path, after the kprobe fires.
+The
+.I dst_ip
+field is always populated.
+.PP
+Inbound ICMP events (captured via
+.BR icmp_rcv )
+show
+.B process=[kernel]
+because the kprobe fires in softirq context.
+The interrupted userspace process is not the ICMP sender.
+.PP
 The
 .I authenticated_user
 field relies on sshd writing PAM credentials before the SSH session is fully
 established.
-In rare cases (PAM stacks that call
-.BR pam_get_item (3)
-very late, or non-standard sshd configurations) the field may be null even for
-authenticated sessions.
+In rare cases the field may be null even for authenticated sessions.
 The
 .I pam_window_secs
 tuning parameter can be increased if this is observed.
+.PP
+DNS query capture
+.RB ( dns_query
+field) works for connected UDP sockets (the common case with glibc's resolver
+and
+.BR dig (1)).
+Resolvers that use
+.BR sendto (2)
+on an unconnected socket will not have the
+.I dns_query
+field populated.
 .PP
 UDP flows use
 .B udp_destroy_sock
 as the close event.
 The timestamp on a UDP
 .B flow_short
-record reflects when the socket was destroyed, which may be significantly after
-the last datagram was sent or received.
+record reflects when the socket was destroyed, which may be after the last
+datagram was sent or received.
 .
 .SH SECURITY
 .SS eBPF safety
@@ -386,8 +628,8 @@ The tool is read-only by design: it observes events but does not modify
 kernel state or network traffic.
 .PP
 .SS Log file sensitivity
-The log file contains authenticated usernames, process names, PIDs, and
-full connection metadata.
+The log file contains authenticated usernames, process names, command lines,
+PIDs, and full connection metadata.
 It is created with mode
 .B 640
 (read-write for root, read-only for the
@@ -395,7 +637,7 @@ It is created with mode
 group) regardless of the process umask.
 Do not relax these permissions.
 Treat the log file with the same care as
-.I /var/log/auth.log.
+.IR /var/log/auth.log .
 .PP
 .SS Protecting the binary
 .B procflow
@@ -412,11 +654,8 @@ with mode
 Verify this after install:
 .PP
 .RS
-.B ls -l /usr/bin/procflow
+.B ls \-l /usr/bin/procflow
 .RE
-.PP
-If running directly from source rather than the installed package, ensure
-the source file is also root-owned and not group- or world-writable.
 .PP
 .SS Capability bounding
 The systemd service sets
@@ -442,10 +681,10 @@ from the bounding set on systems that support the finer-grained capabilities.
 .PP
 .SS What procflow cannot do
 Despite running as root, the hardened service unit prevents
-.BR procflow
+.B procflow
 from: loading kernel modules, modifying cgroup settings, accessing user home
-directories, acquiring real-time scheduling priority, changing its
-execution domain via
+directories, acquiring real-time scheduling priority, changing its execution
+domain via
 .BR personality (2),
 reading the kernel log buffer, creating new namespaces, or using address
 families other than AF_UNIX, AF_INET, and AF_INET6.
