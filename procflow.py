@@ -791,10 +791,9 @@ int kprobe__icmp_rcv(struct pt_regs *ctx, struct sk_buff *skb) {
     struct event_t ev = {};
     ev.evt_type  = EVT_FLOW;
     ev.ts_ns     = bpf_ktime_get_ns();
-    ev.pid       = bpf_get_current_pid_tgid() >> 32;
-    ev.ppid      = get_ppid();
-    ev.uid       = bpf_get_current_uid_gid() & 0xffffffff;
-    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    // pid/ppid/uid/comm intentionally not set: icmp_rcv runs in softirq context,
+    // bpf_get_current_* returns whichever process happens to be scheduled on this
+    // CPU — not the remote sender. Python sets process = "[kernel]" for these.
     ev.af        = AF_INET;
     ev.proto     = IPPROTO_ICMP;
     ev.direction = DIR_INBOUND;
@@ -817,10 +816,7 @@ int kprobe__icmpv6_rcv(struct pt_regs *ctx, struct sk_buff *skb) {
     struct event_t ev = {};
     ev.evt_type  = EVT_FLOW;
     ev.ts_ns     = bpf_ktime_get_ns();
-    ev.pid       = bpf_get_current_pid_tgid() >> 32;
-    ev.ppid      = get_ppid();
-    ev.uid       = bpf_get_current_uid_gid() & 0xffffffff;
-    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    // pid/ppid/uid/comm intentionally not set — softirq context (see icmp_rcv above)
     ev.af        = AF_INET6;
     ev.proto     = IPPROTO_ICMPV6;
     ev.direction = DIR_INBOUND;
@@ -1432,6 +1428,17 @@ def handle_event(cpu, data, size):
         del record["authenticated_user"]
         del record["pam_service"]
         del record["child_processes"]
+        # Inbound ICMP arrives via kernel softirq (icmp_rcv); there is no
+        # userspace process — the BPF context fields are the interrupted CPU
+        # thread, not the sender. Replace with sentinel values.
+        if ev.direction == 1:  # DIR_INBOUND
+            record["process"]  = "[kernel]"
+            record["pid"]      = None
+            record["ppid"]     = None
+            record["uid"]      = None
+            record["username"] = None
+            record["exe"]      = None
+            record["cmdline"]  = None
         emit(record)
         return
 
