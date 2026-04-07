@@ -691,7 +691,7 @@ cleanup:
 int kprobe__raw_sendmsg(struct pt_regs *ctx, struct sock *sk,
                         struct msghdr *msg, size_t len) {
     u8 proto = 0;
-    bpf_probe_read(&proto, sizeof(proto), &sk->__sk_common.skc_protocol);
+    bpf_probe_read(&proto, sizeof(proto), &sk->sk_protocol);
     if (proto != IPPROTO_ICMP) return 0;
 
     struct event_t ev = {};
@@ -717,7 +717,7 @@ int kprobe__raw_sendmsg(struct pt_regs *ctx, struct sock *sk,
 int kprobe__rawv6_sendmsg(struct pt_regs *ctx, struct sock *sk,
                           struct msghdr *msg, size_t len) {
     u8 proto = 0;
-    bpf_probe_read(&proto, sizeof(proto), &sk->__sk_common.skc_protocol);
+    bpf_probe_read(&proto, sizeof(proto), &sk->sk_protocol);
     if (proto != IPPROTO_ICMPV6) return 0;
 
     struct event_t ev = {};
