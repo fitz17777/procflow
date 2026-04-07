@@ -96,6 +96,9 @@ BPF_PROGRAM = r"""
 #include <linux/net.h>
 #include <linux/fs.h>
 #include <linux/file.h>
+#include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/skbuff.h>
 
 #define DIR_OUTBOUND 0
 #define DIR_INBOUND  1
@@ -705,8 +708,21 @@ int kprobe__raw_sendmsg(struct pt_regs *ctx, struct sock *sk,
     ev.proto     = IPPROTO_ICMP;
     ev.direction = DIR_OUTBOUND;
 
+    // Source: bound local address (0.0.0.0 if unbound — routing selects it later)
     bpf_probe_read(&ev.saddr4, sizeof(ev.saddr4), &sk->__sk_common.skc_rcv_saddr);
-    bpf_probe_read(&ev.daddr4, sizeof(ev.daddr4), &sk->__sk_common.skc_daddr);
+
+    // Destination: raw sockets use sendto() without connect(), so skc_daddr is 0.
+    // The destination address is in msg->msg_name (moved to kernel space by the syscall).
+    void *msg_name = NULL;
+    bpf_probe_read_kernel(&msg_name, sizeof(msg_name), &msg->msg_name);
+    if (msg_name) {
+        struct sockaddr_in sa = {};
+        bpf_probe_read_kernel(&sa, sizeof(sa), msg_name);
+        if (sa.sin_family == AF_INET)
+            ev.daddr4 = sa.sin_addr.s_addr;
+    }
+    if (!ev.daddr4)
+        bpf_probe_read(&ev.daddr4, sizeof(ev.daddr4), &sk->__sk_common.skc_daddr);
 
     read_sock_meta(sk, &ev.sock_ino, &ev.netns_ino);
     ev.sock_ptr = (u64)(unsigned long)sk;
@@ -733,11 +749,84 @@ int kprobe__rawv6_sendmsg(struct pt_regs *ctx, struct sock *sk,
 
     bpf_probe_read(&ev.saddr6, sizeof(ev.saddr6),
                    &sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
-    bpf_probe_read(&ev.daddr6, sizeof(ev.daddr6),
-                   &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8);
+
+    // Destination from msg->msg_name for unconnected raw sockets
+    void *msg_name6 = NULL;
+    bpf_probe_read_kernel(&msg_name6, sizeof(msg_name6), &msg->msg_name);
+    if (msg_name6) {
+        struct sockaddr_in6 sa6 = {};
+        bpf_probe_read_kernel(&sa6, sizeof(sa6), msg_name6);
+        if (sa6.sin6_family == AF_INET6)
+            bpf_probe_read_kernel(&ev.daddr6, sizeof(ev.daddr6),
+                                  &sa6.sin6_addr.in6_u.u6_addr8);
+    }
+    if (!*(u64 *)ev.daddr6)
+        bpf_probe_read(&ev.daddr6, sizeof(ev.daddr6),
+                       &sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8);
 
     read_sock_meta(sk, &ev.sock_ino, &ev.netns_ino);
     ev.sock_ptr = (u64)(unsigned long)sk;
+    events.perf_submit(ctx, &ev, sizeof(ev));
+    return 0;
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  INBOUND ICMP — kernel receives ICMP packets via icmp_rcv / icmpv6_rcv.
+//  The process context here is kernel softirq, not a userspace process.
+// ════════════════════════════════════════════════════════════════════════════
+
+int kprobe__icmp_rcv(struct pt_regs *ctx, struct sk_buff *skb) {
+    unsigned char *head = NULL;
+    bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+    u16 nh_off = 0;
+    bpf_probe_read_kernel(&nh_off, sizeof(nh_off), &skb->network_header);
+
+    struct iphdr iph = {};
+    bpf_probe_read_kernel(&iph, sizeof(iph), head + nh_off);
+
+    // Skip loopback
+    if ((iph.saddr & 0xff) == 127 || (iph.daddr & 0xff) == 127) return 0;
+
+    struct event_t ev = {};
+    ev.evt_type  = EVT_FLOW;
+    ev.ts_ns     = bpf_ktime_get_ns();
+    ev.pid       = bpf_get_current_pid_tgid() >> 32;
+    ev.ppid      = get_ppid();
+    ev.uid       = bpf_get_current_uid_gid() & 0xffffffff;
+    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    ev.af        = AF_INET;
+    ev.proto     = IPPROTO_ICMP;
+    ev.direction = DIR_INBOUND;
+    ev.saddr4    = iph.saddr;   // remote sender
+    ev.daddr4    = iph.daddr;   // local host
+
+    events.perf_submit(ctx, &ev, sizeof(ev));
+    return 0;
+}
+
+int kprobe__icmpv6_rcv(struct pt_regs *ctx, struct sk_buff *skb) {
+    unsigned char *head = NULL;
+    bpf_probe_read_kernel(&head, sizeof(head), &skb->head);
+    u16 nh_off = 0;
+    bpf_probe_read_kernel(&nh_off, sizeof(nh_off), &skb->network_header);
+
+    struct ipv6hdr iph6 = {};
+    bpf_probe_read_kernel(&iph6, sizeof(iph6), head + nh_off);
+
+    struct event_t ev = {};
+    ev.evt_type  = EVT_FLOW;
+    ev.ts_ns     = bpf_ktime_get_ns();
+    ev.pid       = bpf_get_current_pid_tgid() >> 32;
+    ev.ppid      = get_ppid();
+    ev.uid       = bpf_get_current_uid_gid() & 0xffffffff;
+    bpf_get_current_comm(&ev.comm, sizeof(ev.comm));
+    ev.af        = AF_INET6;
+    ev.proto     = IPPROTO_ICMPV6;
+    ev.direction = DIR_INBOUND;
+    bpf_probe_read_kernel(&ev.saddr6, sizeof(ev.saddr6), &iph6.saddr.in6_u.u6_addr8);
+    bpf_probe_read_kernel(&ev.daddr6, sizeof(ev.daddr6), &iph6.daddr.in6_u.u6_addr8);
+
     events.perf_submit(ctx, &ev, sizeof(ev));
     return 0;
 }
