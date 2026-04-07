@@ -3,7 +3,7 @@
 # Usage: curl -sSL https://raw.githubusercontent.com/fitz17777/procflow/main/install.sh | sudo bash
 set -euo pipefail
 
-VERSION="1.0.3"
+VERSION="1.1.0"
 DEB_URL="https://github.com/fitz17777/procflow/releases/download/v${VERSION}/procflow_${VERSION}_amd64.deb"
 DEB_FILE="/tmp/procflow_${VERSION}_amd64.deb"
 
