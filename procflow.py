@@ -38,7 +38,7 @@ Requirements:
     sudo apt install python3-bpfcc bpfcc-tools linux-headers-$(uname -r)
 """
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 import argparse
 import configparser
@@ -1084,6 +1084,11 @@ FLOW_TRACK_SECS  = 3600.0
 # Any flow whose netns_ino differs from this value is container traffic.
 HOST_NETNS_INO: int = 0
 
+# Suppress rules: list of (process_name, dst_ip, dst_port) tuples loaded from
+# the [filter] section of the config file. Events matching any rule are dropped
+# before writing to the log. Empty list = no suppression (default).
+SUPPRESS_RULES: list = []
+
 # Tracks open TCP/UDP flows.
 # Key: (local_ip, local_port, remote_ip, remote_port, proto_str) — socket-native order
 # Value: {
@@ -1115,6 +1120,21 @@ def load_config(path):
     PAM_WINDOW_SECS  = cfg.getfloat('tuning', 'pam_window_secs',  fallback=PAM_WINDOW_SECS)
     FLOW_SHORT_SECS  = cfg.getfloat('tuning', 'flow_short_secs',  fallback=FLOW_SHORT_SECS)
     FLOW_TRACK_SECS  = cfg.getfloat('tuning', 'flow_track_secs',  fallback=FLOW_TRACK_SECS)
+
+    global SUPPRESS_RULES
+    rules = []
+    raw = cfg.get('filter', 'suppress', fallback='')
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) == 3:
+            try:
+                rules.append((parts[0], parts[1], int(parts[2])))
+            except ValueError:
+                pass  # malformed port — skip
+    SUPPRESS_RULES = rules
 
     return log_file, max_bytes, backups
 
@@ -1215,6 +1235,12 @@ def setup_logging(log_file, max_bytes, backup_count, stdout_only=False):
     _json_logger.addHandler(handler)
 
 def emit(record: dict):
+    if SUPPRESS_RULES:
+        proc = record.get("process") or ""
+        dip  = record.get("dst_ip") or ""
+        dp   = record.get("dst_port")
+        if any(proc == r[0] and dip == r[1] and dp == r[2] for r in SUPPRESS_RULES):
+            return
     line = json.dumps(record)
     print(line, flush=True)
     _json_logger.info(line)

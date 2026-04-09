@@ -1,4 +1,4 @@
-.TH PROCFLOW 8 "April 2026" "ProcFlow 1.1.0" "System Administration"
+.TH PROCFLOW 8 "April 2026" "ProcFlow 1.1.1" "System Administration"
 .
 .SH NAME
 procflow \- process-enriched network flow logger
@@ -159,6 +159,44 @@ table (safety fallback for connections that close without a
 event being observed).
 Default:
 .BR 3600.0 .
+.PP
+.B [filter] section
+.TP
+.B suppress
+A list of suppression rules, one per line (continuation lines must be indented
+with at least one space or tab).
+Each rule has the form:
+.PP
+.RS
+.I process_name\fR,\fP dst_ip\fR,\fP dst_port
+.RE
+.PP
+An event is dropped before being written to the log if its
+.IR process ,
+.IR dst_ip ,
+and
+.I dst_port
+fields all match a rule exactly.
+Other connections from the same process to different destinations are unaffected.
+.PP
+This is useful for breaking feedback loops when a log shipper (such as Elastic Agent)
+is forwarding procflow's log file to a remote server: procflow logs those outbound
+connections, which the shipper then forwards again.
+Add one rule per shipper→server connection to suppress only the shipping traffic.
+.PP
+Example \(em suppress Elastic Agent log shipping:
+.PP
+.RS
+.nf
+[filter]
+suppress =
+    agentbeat, 10.10.20.18, 9200
+    elastic-agent, 10.10.20.18, 8220
+.fi
+.RE
+.PP
+If the key is absent the default is no suppression.
+Changes take effect after restarting the service.
 .
 .SH OUTPUT FORMAT
 All output is newline-delimited JSON.

@@ -235,12 +235,26 @@ backup_count = 5
 
 Restart after changes: `sudo systemctl restart procflow`
 
+### Suppressing specific connections
+
+If a log shipper (e.g. Elastic Agent) is forwarding procflow's log file to a remote server, procflow will log those outbound connections — which the shipper then sends again, creating a feedback loop. Use the `[filter]` section to suppress only the specific process→destination connections responsible:
+
+```ini
+[filter]
+# Format: process_name, dst_ip, dst_port  (one rule per indented line)
+suppress =
+    agentbeat, 10.10.20.18, 9200
+    elastic-agent, 10.10.20.18, 8220
+```
+
+Each rule matches on **all three fields** — process name, destination IP, and destination port. Other connections from the same process (e.g. Elastic Agent health checks to a different destination) are still logged. Restart the service after editing the config.
+
 ## Manual install
 
 ```bash
 sudo apt install linux-headers-$(uname -r) python3-bpfcc bpfcc-tools
-wget https://github.com/fitz17777/procflow/releases/latest/download/procflow_1.1.0_amd64.deb
-sudo dpkg -i procflow_1.1.0_amd64.deb
+wget https://github.com/fitz17777/procflow/releases/latest/download/procflow_1.1.1_amd64.deb
+sudo dpkg -i procflow_1.1.1_amd64.deb
 ```
 
 ## Uninstall
